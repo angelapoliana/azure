@@ -1,0 +1,82 @@
+stages:
+  - test
+  - build
+  - scan
+  - deploy
+
+Lint Dockerfile:
+  stage: test
+  image: hadolint/hadolint:latest-debian
+  script:
+    - hadolint Dockerfile
+
+Docker Build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind  
+  before_script:
+    - export DOCKER_TAG=`if [ $CI_COMMIT_SHORT_BRANCH == "master" ]; then echo $CI_COMMIT_SHORT_SHA; else echo $CI_COMMIT_TAG; fi;`
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  # Default branch leaves tag empty (= latest tag)
+  # All other branches are tagged with the escaped branch name (commit ref slug)
+  script:
+    - docker build --pull -t "$CI_REGISTRY/$CI_REGISTRY_USER/podinfo:$CI_COMMIT_SHORT_SHA" .
+    #- docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:latest"
+    - docker push "$CI_REGISTRY/$CI_REGISTRY_USER/podinfo:$CI_COMMIT_SHORT_SHA"
+    #- docker push "$CI_REGISTRY/$SEU_USER_GITLAB/DesafioDevOps:$CI_COMMIT_SHORT_SHA"
+  # Run this job in a branch where a Dockerfile exists
+  only:
+    - master
+
+Container_Scanning:
+  stage: scan
+  image:
+    name: docker.io/aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: none
+    TRIVY_USERNAME: "$CI_REGISTRY_USER"
+    TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+    TRIVY_AUTH_URL: "$CI_REGISTRY"
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_CACHE_DIR: ".trivycache/"
+    FULL_IMAGE_NAME: $CI_REGISTRY/$CI_REGISTRY_USER/podinfo:$CI_COMMIT_SHORT_SHA
+  script:
+    - trivy --version
+    # cache cleanup is needed when scanning images with the same tags, it does not remove the database
+    - time trivy image --clear-cache
+    # update vulnerabilities db
+    - time trivy image --download-db-only
+    # Builds report and puts it in the default workdir $CI_PROJECT_DIR, so `artifacts:` can take it from there
+    - time trivy image --exit-code 0 --format template --template "@/contrib/gitlab.tpl"
+        --output "$CI_PROJECT_DIR/gl-container-scanning-report.json" "$FULL_IMAGE_NAME"
+    # Prints full report
+    - time trivy image --exit-code 0 "$FULL_IMAGE_NAME"
+    # Fail on critical vulnerabilities
+    - time trivy image --exit-code 1 --severity CRITICAL "$FULL_IMAGE_NAME"
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    when:                          always
+    reports:
+      container_scanning:          gl-container-scanning-report.json
+  tags:
+    - docker-runner
+
+Kubernetes Deployment:
+  stage: deploy
+  variables: 
+    DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: ['']
+  script:
+    - sed -i 's/<DOCKER_TAG>/'$DOCKER_TAG'/g' deployment.yaml
+    - kubectl config get-contexts
+    - kubectl config use-context angela.poliana/DesafioDevOps:angela0307
+    - kubectl apply -f deployment.yaml
+    - kubectl get pods
+  only:
+    - master
